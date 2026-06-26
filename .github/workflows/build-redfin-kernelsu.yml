@@ -78,27 +78,39 @@ jobs:
         run: |
           cd "kernel_workspace/$KERNEL_DIR"
           python3 <<'PY'
+          import re
           from pathlib import Path
 
-          def replace_once(path, old, new):
+          def edit(path, fn):
               p = Path(path)
               s = p.read_text()
-              if new in s:
+              ns = fn(s)
+              if ns == s:
                   return
-              if old not in s:
-                  raise SystemExit(f"pattern not found in {path}")
-              p.write_text(s.replace(old, new, 1))
+              p.write_text(ns)
 
-          replace_once(
+          def insert_before(path, marker, block):
+              def apply(s):
+                  if block in s:
+                      return s
+                  if marker not in s:
+                      raise SystemExit(f"marker not found in {path}: {marker!r}")
+                  return s.replace(marker, block + marker, 1)
+              edit(path, apply)
+
+          def replace_re(path, pattern, block, present):
+              def apply(s):
+                  if present in s:
+                      return s
+                  ns, n = re.subn(pattern, lambda m: m.group(1) + block + m.group(2), s, count=1, flags=re.S)
+                  if n != 1:
+                      raise SystemExit(f"pattern not found in {path}: {pattern}")
+                  return ns
+              edit(path, apply)
+
+          insert_before(
               "fs/exec.c",
-              """static int do_execveat_common(int fd, struct filename *filename,
-                  struct user_arg_ptr argv,
-                  struct user_arg_ptr envp,
-                  int flags)
-          {
-              return __do_execve_file(fd, filename, argv, envp, flags, NULL);
-          }
-          """,
+              "static int do_execveat_common",
               """#ifdef CONFIG_KSU
           extern bool ksu_execveat_hook __read_mostly;
           extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
@@ -106,119 +118,77 @@ jobs:
           extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
                        void *argv, void *envp, int *flags);
           #endif
-          static int do_execveat_common(int fd, struct filename *filename,
-                  struct user_arg_ptr argv,
-                  struct user_arg_ptr envp,
-                  int flags)
-          {
-          #ifdef CONFIG_KSU
+          """,
+          )
+          replace_re(
+              "fs/exec.c",
+              r"(static int do_execveat_common\(int fd, struct filename \*filename,\s*struct user_arg_ptr argv,\s*struct user_arg_ptr envp,\s*int flags\)\s*\{\s*)(return __do_execve_file\(fd, filename, argv, envp, flags, NULL\);)",
+              """#ifdef CONFIG_KSU
               if (unlikely(ksu_execveat_hook))
                   ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
               else
                   ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
           #endif
-              return __do_execve_file(fd, filename, argv, envp, flags, NULL);
-          }
           """,
+              "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags)",
           )
 
-          replace_once(
+          insert_before(
               "fs/open.c",
-              """/*
-           * access() needs to use the real uid/gid, not the effective uid/gid.
-           * We do this by temporarily clearing all FS-related capabilities and
-           * switching the fsuid/fsgid around to the real ones.
-           */
-          long do_faccessat(int dfd, const char __user *filename, int mode)
-          {
-              const struct cred *old_cred;
-              struct cred *override_cred;
-              struct path path;
-              struct inode *inode;
-              int res;
-              unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-              if (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */
-          """,
+              "/*\n * access() needs to use the real uid/gid, not the effective uid/gid.",
               """#ifdef CONFIG_KSU
           extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
                        int *flags);
           #endif
-          /*
-           * access() needs to use the real uid/gid, not the effective uid/gid.
-           * We do this by temporarily clearing all FS-related capabilities and
-           * switching the fsuid/fsgid around to the real ones.
-           */
-          long do_faccessat(int dfd, const char __user *filename, int mode)
-          {
-              const struct cred *old_cred;
-              struct cred *override_cred;
-              struct path path;
-              struct inode *inode;
-              int res;
-              unsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          #ifdef CONFIG_KSU
-              ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif
-              if (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */
           """,
           )
-
-          replace_once(
-              "fs/read_write.c",
-              """EXPORT_SYMBOL(kernel_read);
-
-          ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
-          {
-              ssize_t ret;
-
-              if (!(file->f_mode & FMODE_READ))
+          replace_re(
+              "fs/open.c",
+              r"(long do_faccessat\(int dfd, const char __user \*filename, int mode\)\s*\{.*?unsigned int lookup_flags = LOOKUP_FOLLOW;\s*)()",
+              """#ifdef CONFIG_KSU
+              ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
           """,
-              """EXPORT_SYMBOL(kernel_read);
+              "ksu_handle_faccessat(&dfd, &filename, &mode, NULL)",
+          )
 
-          #ifdef CONFIG_KSU
+          insert_before(
+              "fs/read_write.c",
+              "ssize_t vfs_read",
+              """#ifdef CONFIG_KSU
           extern bool ksu_vfs_read_hook __read_mostly;
           extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
                       size_t *count_ptr, loff_t **pos);
           #endif
-          ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
-          {
-              ssize_t ret;
-
-          #ifdef CONFIG_KSU
+          """,
+          )
+          replace_re(
+              "fs/read_write.c",
+              r"(ssize_t vfs_read\(struct file \*file, char __user \*buf, size_t count, loff_t \*pos\)\s*\{\s*ssize_t ret;\s*)()",
+              """#ifdef CONFIG_KSU
               if (unlikely(ksu_vfs_read_hook))
                   ksu_handle_vfs_read(&file, &buf, &count, &pos);
           #endif
-              if (!(file->f_mode & FMODE_READ))
           """,
+              "ksu_handle_vfs_read(&file, &buf, &count, &pos)",
           )
 
-          replace_once(
+          insert_before(
               "fs/stat.c",
-              """EXPORT_SYMBOL(vfs_statx_fd);
-
-          /**
-           * vfs_statx - Get basic and extra attributes by filename
-          """,
-              """EXPORT_SYMBOL(vfs_statx_fd);
-
-          #ifdef CONFIG_KSU
+              "/**\n * vfs_statx - Get basic and extra attributes by filename",
+              """#ifdef CONFIG_KSU
           extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
           #endif
-          /**
-           * vfs_statx - Get basic and extra attributes by filename
           """,
           )
-          replace_once(
+          replace_re(
               "fs/stat.c",
-              "\tunsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;\n\n"
-              "\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |\n",
-              "\tunsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;\n\n"
-              "#ifdef CONFIG_KSU\n"
-              "\tksu_handle_stat(&dfd, &filename, &flags);\n"
-              "#endif\n"
-              "\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |\n",
+              r"(int vfs_statx\(int dfd, const char __user \*filename, int flags,\s*struct kstat \*stat, u32 request_mask\)\s*\{.*?unsigned int lookup_flags = LOOKUP_FOLLOW \| LOOKUP_AUTOMOUNT;\s*)()",
+              """#ifdef CONFIG_KSU
+              ksu_handle_stat(&dfd, &filename, &flags);
+          #endif
+          """,
+              "ksu_handle_stat(&dfd, &filename, &flags)",
           )
           PY
 
