@@ -91,8 +91,8 @@ jobs:
           cd kernel_workspace
           CUSTOM_BUILD_CONFIG="${{ inputs.build_config }}.kernelsu"
           cp "${{ inputs.build_config }}" "$CUSTOM_BUILD_CONFIG"
-          if grep -q '^POST_DEFCONFIG_CMDS=' "$CUSTOM_BUILD_CONFIG"; then
-            sed -i 's/^POST_DEFCONFIG_CMDS=.*/POST_DEFCONFIG_CMDS=""/' "$CUSTOM_BUILD_CONFIG"
+          if grep -q 'update_nocfi_config' "$CUSTOM_BUILD_CONFIG"; then
+            echo 'POST_DEFCONFIG_CMDS="update_nocfi_config"' >> "$CUSTOM_BUILD_CONFIG"
           else
             echo 'POST_DEFCONFIG_CMDS=""' >> "$CUSTOM_BUILD_CONFIG"
           fi
