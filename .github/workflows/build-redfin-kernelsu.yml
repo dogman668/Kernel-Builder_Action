@@ -16,6 +16,10 @@ on:
         required: true
         type: boolean
         default: true
+      localversion:
+        description: Kernel localversion to match stock vendor_boot modules
+        required: true
+        default: -g7b0944645172-ab10812814
 
 permissions:
   contents: read
@@ -75,6 +79,8 @@ jobs:
           cd "kernel_workspace/$KERNEL_DIR"
           DEFCONFIG_PATH="arch/$ARCH/configs/$DEFCONFIG"
           scripts/config --file "$DEFCONFIG_PATH" \
+            --set-str LOCALVERSION "${{ inputs.localversion }}" \
+            -d LOCALVERSION_AUTO \
             -e KSU \
             -e MODULES \
             -e KPROBES \
