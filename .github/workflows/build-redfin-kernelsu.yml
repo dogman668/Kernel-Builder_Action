@@ -89,7 +89,15 @@ jobs:
       - name: Build kernel
         run: |
           cd kernel_workspace
-          BUILD_CONFIG="${{ inputs.build_config }}" build/build.sh
+          CUSTOM_BUILD_CONFIG="${{ inputs.build_config }}.kernelsu"
+          cp "${{ inputs.build_config }}" "$CUSTOM_BUILD_CONFIG"
+          if grep -q '^POST_DEFCONFIG_CMDS=' "$CUSTOM_BUILD_CONFIG"; then
+            sed -i 's/^POST_DEFCONFIG_CMDS=.*/POST_DEFCONFIG_CMDS=""/' "$CUSTOM_BUILD_CONFIG"
+          else
+            echo 'POST_DEFCONFIG_CMDS=""' >> "$CUSTOM_BUILD_CONFIG"
+          fi
+          echo "Using BUILD_CONFIG=$CUSTOM_BUILD_CONFIG"
+          BUILD_CONFIG="$CUSTOM_BUILD_CONFIG" build/build.sh
 
       - name: Collect artifacts
         if: always()
