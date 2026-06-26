@@ -74,6 +74,158 @@ jobs:
           KSU_VERSION="$(cd KernelSU && expr "$(git rev-list --count HEAD)" + 10200)"
           echo "KSU_VERSION=$KSU_VERSION" >> "$GITHUB_ENV"
 
+      - name: Patch non-GKI KernelSU hooks
+        run: |
+          cd "kernel_workspace/$KERNEL_DIR"
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if new in s:
+                  return
+              if old not in s:
+                  raise SystemExit(f"pattern not found in {path}")
+              p.write_text(s.replace(old, new, 1))
+
+          replace_once(
+              "fs/exec.c",
+              """static int do_execveat_common(int fd, struct filename *filename,
+                  struct user_arg_ptr argv,
+                  struct user_arg_ptr envp,
+                  int flags)
+          {
+              return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+          }
+          """,
+              """#ifdef CONFIG_KSU
+          extern bool ksu_execveat_hook __read_mostly;
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+                      void *envp, int *flags);
+          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+                       void *argv, void *envp, int *flags);
+          #endif
+          static int do_execveat_common(int fd, struct filename *filename,
+                  struct user_arg_ptr argv,
+                  struct user_arg_ptr envp,
+                  int flags)
+          {
+          #ifdef CONFIG_KSU
+              if (unlikely(ksu_execveat_hook))
+                  ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+              else
+                  ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+          #endif
+              return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+          }
+          """,
+          )
+
+          replace_once(
+              "fs/open.c",
+              """/*
+           * access() needs to use the real uid/gid, not the effective uid/gid.
+           * We do this by temporarily clearing all FS-related capabilities and
+           * switching the fsuid/fsgid around to the real ones.
+           */
+          long do_faccessat(int dfd, const char __user *filename, int mode)
+          {
+              const struct cred *old_cred;
+              struct cred *override_cred;
+              struct path path;
+              struct inode *inode;
+              int res;
+              unsigned int lookup_flags = LOOKUP_FOLLOW;
+
+              if (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */
+          """,
+              """#ifdef CONFIG_KSU
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+                       int *flags);
+          #endif
+          /*
+           * access() needs to use the real uid/gid, not the effective uid/gid.
+           * We do this by temporarily clearing all FS-related capabilities and
+           * switching the fsuid/fsgid around to the real ones.
+           */
+          long do_faccessat(int dfd, const char __user *filename, int mode)
+          {
+              const struct cred *old_cred;
+              struct cred *override_cred;
+              struct path path;
+              struct inode *inode;
+              int res;
+              unsigned int lookup_flags = LOOKUP_FOLLOW;
+
+          #ifdef CONFIG_KSU
+              ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+              if (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */
+          """,
+          )
+
+          replace_once(
+              "fs/read_write.c",
+              """EXPORT_SYMBOL(kernel_read);
+
+          ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+          {
+              ssize_t ret;
+
+              if (!(file->f_mode & FMODE_READ))
+          """,
+              """EXPORT_SYMBOL(kernel_read);
+
+          #ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
+                      size_t *count_ptr, loff_t **pos);
+          #endif
+          ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+          {
+              ssize_t ret;
+
+          #ifdef CONFIG_KSU
+              if (unlikely(ksu_vfs_read_hook))
+                  ksu_handle_vfs_read(&file, &buf, &count, &pos);
+          #endif
+              if (!(file->f_mode & FMODE_READ))
+          """,
+          )
+
+          replace_once(
+              "fs/stat.c",
+              """EXPORT_SYMBOL(vfs_statx_fd);
+
+          /**
+           * vfs_statx - Get basic and extra attributes by filename
+          """,
+              """EXPORT_SYMBOL(vfs_statx_fd);
+
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          #endif
+          /**
+           * vfs_statx - Get basic and extra attributes by filename
+          """,
+          )
+          replace_once(
+              "fs/stat.c",
+              """\tunsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+
+\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+""",
+              """\tunsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+
+#ifdef CONFIG_KSU
+\tksu_handle_stat(&dfd, &filename, &flags);
+#endif
+\tif ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+""",
+          )
+          PY
+
       - name: Patch redbull defconfig
         run: |
           cd "kernel_workspace/$KERNEL_DIR"
@@ -83,9 +235,8 @@ jobs:
             -d LOCALVERSION_AUTO \
             -e KSU \
             -e MODULES \
-            -e KPROBES \
-            -e HAVE_KPROBES \
-            -e KPROBE_EVENTS \
+            -d KPROBES \
+            -d KPROBE_EVENTS \
             -e OVERLAY_FS
           if [[ "${{ inputs.disable_cc_werror }}" == "true" ]]; then
             scripts/config --file "$DEFCONFIG_PATH" -d CC_WERROR
@@ -103,6 +254,8 @@ jobs:
             echo 'POST_DEFCONFIG_CMDS=""' >> "$CUSTOM_BUILD_CONFIG"
           fi
           echo 'LOCALVERSION=' >> "$CUSTOM_BUILD_CONFIG"
+          echo 'KBUILD_BUILD_USER=ksu-codex' >> "$CUSTOM_BUILD_CONFIG"
+          echo 'KBUILD_BUILD_HOST=redfin-manual' >> "$CUSTOM_BUILD_CONFIG"
           echo "Using BUILD_CONFIG=$CUSTOM_BUILD_CONFIG"
           BUILD_CONFIG="$CUSTOM_BUILD_CONFIG" build/build.sh
 
